@@ -4,7 +4,7 @@ import (
 	"errors"
 	"github.com/google/uuid"
 	"github.com/paroxity/portal/event"
-	"github.com/paroxity/portal/query"
+	"github.com/paroxity/portal/internal"
 	"github.com/paroxity/portal/server"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
@@ -13,24 +13,22 @@ import (
 	"github.com/scylladb/go-set/i32set"
 	"github.com/scylladb/go-set/i64set"
 	"github.com/scylladb/go-set/strset"
-	"github.com/sirupsen/logrus"
 	"go.uber.org/atomic"
-	"strings"
 	"sync"
 	"time"
 )
 
 var (
 	emptyChunkData = make([]byte, 257)
-
-	sessions, nameToUUID sync.Map
 )
 
 // Session stores the data for an active session on the proxy.
 type Session struct {
 	*translator
 
-	conn *minecraft.Conn
+	log   internal.Logger
+	conn  *minecraft.Conn
+	store *Store
 
 	hMutex sync.RWMutex
 	// h holds the current handler of the session.
@@ -54,38 +52,12 @@ type Session struct {
 	once         sync.Once
 }
 
-// All returns all of the connected sessions on the proxy.
-func All() []*Session {
-	var s []*Session
-	sessions.Range(func(_, v interface{}) bool {
-		s = append(s, v.(*Session))
-		return true
-	})
-	return s
-}
-
-// Lookup attempts to find a Session with the provided UUID.
-func Lookup(v uuid.UUID) (*Session, bool) {
-	s, ok := sessions.Load(v)
-	if !ok {
-		return nil, false
-	}
-	return s.(*Session), true
-}
-
-// LookupByName attempts to find a session with the provided name.
-func LookupByName(name string) (*Session, bool) {
-	v, ok := nameToUUID.Load(strings.ToLower(name))
-	if !ok {
-		return nil, false
-	}
-	return Lookup(v.(uuid.UUID))
-}
-
 // New creates a new Session with the provided connection.
-func New(conn *minecraft.Conn) (_ *Session, err error) {
+func New(conn *minecraft.Conn, store *Store, loadBalancer LoadBalancer, log internal.Logger) (_ *Session, err error) {
 	s := &Session{
-		conn: conn,
+		log:   log,
+		conn:  conn,
+		store: store,
 
 		entities:    i64set.New(),
 		playerList:  b16set.New(),
@@ -97,16 +69,14 @@ func New(conn *minecraft.Conn) (_ *Session, err error) {
 		uuid: uuid.MustParse(conn.IdentityData().Identity),
 	}
 
-	sessions.Store(s.uuid, s)
-	nameToUUID.Store(strings.ToLower(conn.IdentityData().DisplayName), s.uuid)
+	store.Store(s)
 	defer func() {
 		if err != nil {
-			sessions.Delete(s.uuid)
-			nameToUUID.Delete(strings.ToLower(conn.IdentityData().DisplayName))
+			store.Delete(s.UUID())
 		}
 	}()
 
-	srv := LoadBalancer()(s)
+	srv := loadBalancer.FindServer(s)
 	if srv == nil {
 		return nil, errors.New("load balancer did not return a server for the player to join")
 	}
@@ -128,7 +98,6 @@ func New(conn *minecraft.Conn) (_ *Session, err error) {
 
 	handlePackets(s)
 	srv.IncrementPlayerCount()
-	query.IncrementPlayerCount()
 	return s, nil
 }
 
@@ -202,7 +171,7 @@ func (s *Session) Transfer(srv *server.Server) (err error) {
 		return errors.New("already being transferred")
 	}
 
-	logrus.Infof("Transferring %s to server %s in group %s\n", s.conn.IdentityData().DisplayName, srv.Name(), srv.Group())
+	s.log.Infof("%s is being transferred from %s to %s", s.conn.IdentityData().DisplayName, s.Server().Name(), srv.Name())
 
 	ctx := event.C()
 	s.handler().HandleTransfer(ctx, srv)
@@ -277,8 +246,7 @@ func (s *Session) Close() {
 		s.handler().HandleQuit()
 		s.Handle(NopHandler{})
 
-		sessions.Delete(s.UUID())
-		nameToUUID.Delete(s.conn.IdentityData().DisplayName)
+		s.store.Delete(s.UUID())
 
 		_ = s.conn.Close()
 		_ = s.ServerConn().Close()
@@ -286,8 +254,7 @@ func (s *Session) Close() {
 			_ = s.tempServerConn.Close()
 		}
 
-		s.server.DecrementPlayerCount()
-		query.DecrementPlayerCount()
+		s.Server().DecrementPlayerCount()
 	})
 }
 
@@ -328,7 +295,7 @@ func (s *Session) clearEffects() {
 	s.effects.Clear()
 }
 
-// clearBossBars clears all of the boss bars currently visible the client.
+// clearBossBars clears all the boss bars currently visible the client.
 func (s *Session) clearBossBars() {
 	s.bossBars.Each(func(b int64) bool {
 		_ = s.conn.WritePacket(&packet.BossEvent{

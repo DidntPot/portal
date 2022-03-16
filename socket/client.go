@@ -4,16 +4,18 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"github.com/paroxity/portal/internal"
 	"github.com/paroxity/portal/server"
 	"github.com/paroxity/portal/socket/packet"
 	"github.com/sandertv/gophertunnel/minecraft/protocol"
-	"github.com/sirupsen/logrus"
+	"go.uber.org/atomic"
 	"net"
 	"sync"
 )
 
 // Client represents a client connected over the TCP socket system.
 type Client struct {
+	log  internal.Logger
 	conn net.Conn
 
 	pool packet.Pool
@@ -25,12 +27,15 @@ type Client struct {
 	name       string
 	clientType uint8
 	extraData  map[string]interface{}
+
+	authenticated atomic.Bool
 }
 
 // NewClient creates a new socket Client with default allocations and required data. It pre-allocates 4096
 // bytes to prevent allocations during runtime as much as possible.
-func NewClient(conn net.Conn) *Client {
+func NewClient(conn net.Conn, log internal.Logger) *Client {
 	return &Client{
+		log:  log,
 		conn: conn,
 
 		pool: packet.NewPool(),
@@ -47,20 +52,27 @@ func (c *Client) Name() string {
 }
 
 // Close closes the client and related connections.
-func (c *Client) Close() error {
-	logrus.Debugf("Socket connection \"%s\" closed\n", c.name)
+func (c *Client) Close(registry *server.Registry) error {
+	c.log.Debugf("Socket connection \"%s\" closed", c.name)
 
 	switch c.clientType {
 	case packet.ClientTypeServer:
-		if name, ok := c.extraData["group"]; ok {
-			g, _ := server.GroupFromName(name.(string))
-			s, _ := g.Server(c.name)
-
-			server_setConn(s, nil)
+		if srv, ok := registry.Server(c.Name()); ok {
+			registry.RemoveServer(srv)
 		}
 	}
 
 	return c.conn.Close()
+}
+
+// Authenticate marks the client as authenticated.
+func (c *Client) Authenticate() {
+	c.authenticated.Store(true)
+}
+
+// Authenticated returns if the client has been authenticated or not.
+func (c *Client) Authenticated() bool {
+	return c.authenticated.Load()
 }
 
 // ReadPacket reads a packet from the connection and returns it. The client is expected to prefix the packet
